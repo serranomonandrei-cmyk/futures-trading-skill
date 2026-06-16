@@ -1,0 +1,20 @@
+{
+  "current_version": 1,
+  "min_trades_for_evolution": 30,
+  "cooldown_trades": 50,
+  "cooldown_days": 7,
+  "revert_triggers": {
+    "win_rate_threshold": 45,
+    "consecutive_losses": 8
+  },
+  "versions": [
+    {
+      "version": 1,
+      "date": "2026-06-16",
+      "change": "Initial strategy template",
+      "details": "Default STRATEGY.md created with base rules",
+      "metrics_at_change": null,
+      "triggered_by": "system_init"
+    }
+  ]
+}
