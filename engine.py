@@ -33,8 +33,11 @@ DAILY_LOSS_TIER_1 = 0.06  # 6% — reduce size
 DAILY_LOSS_TIER_2 = 0.10  # 10% — halt entries
 DAILY_LOSS_TIER_3 = 0.12  # 12% — close all, halt 24h
 
-# Correlation groups (don't open positions in same group)
-CORRELATION_GROUPS = [
+# Correlation threshold for grouping
+CORRELATION_THRESHOLD = 0.7  # Pairs with corr > 0.7 are in same group
+
+# Default fallback groups (used if dynamic calculation fails)
+DEFAULT_CORRELATION_GROUPS = [
     ["BTCUSDT", "ETHUSDT"],
     ["SOLUSDT", "AVAXUSDT", "DOTUSDT"],
 ]
@@ -158,14 +161,170 @@ class TradingState:
 
 
 # =============================================================================
+# DYNAMIC CORRELATION MANAGER
+# =============================================================================
+
+class CorrelationManager:
+    """Manages dynamic correlation groups between trading pairs."""
+
+    def __init__(self, exchange=None, threshold=CORRELATION_THRESHOLD):
+        self.exchange = exchange
+        self.threshold = threshold
+        self.groups = []
+        self.correlation_matrix = {}
+        self.last_update = None
+        self._use_default = exchange is None
+
+    def update(self, symbols: list):
+        """Recalculate correlation groups for given symbols."""
+        if self._use_default or self.exchange is None:
+            self.groups = [g.copy() for g in DEFAULT_CORRELATION_GROUPS]
+            self.last_update = datetime.now()
+            return
+
+        try:
+            returns = {}
+            for symbol in symbols:
+                returns[symbol] = self._get_returns(symbol)
+
+            # Calculate correlation matrix
+            self.correlation_matrix = {}
+            for s1 in symbols:
+                for s2 in symbols:
+                    if s1 != s2 and s1 in returns and s2 in returns:
+                        corr = self._calculate_correlation(returns[s1], returns[s2])
+                        self.correlation_matrix[(s1, s2)] = corr
+
+            # Form groups
+            self.groups = self._form_groups()
+            self.last_update = datetime.now()
+
+        except Exception as e:
+            # Fallback to default groups on error
+            self.groups = [g.copy() for g in DEFAULT_CORRELATION_GROUPS]
+            self.last_update = datetime.now()
+
+    def _get_returns(self, symbol: str, lookback: int = 48) -> list:
+        """Get hourly returns for correlation calculation."""
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, '1h', limit=lookback + 1)
+            closes = [c[4] for c in ohlcv]
+            returns = [(closes[i] - closes[i-1]) / closes[i-1]
+                       for i in range(1, len(closes))]
+            return returns[-lookback:]
+        except Exception:
+            return []
+
+    def _calculate_correlation(self, returns_x: list, returns_y: list) -> float:
+        """Calculate Pearson correlation coefficient."""
+        if len(returns_x) < 10 or len(returns_y) < 10:
+            return 0.0
+
+        n = min(len(returns_x), len(returns_y))
+        x = returns_x[-n:]
+        y = returns_y[-n:]
+
+        mean_x = sum(x) / n
+        mean_y = sum(y) / n
+
+        numerator = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
+        denom_x = sum((x[i] - mean_x) ** 2 for i in range(n))
+        denom_y = sum((y[i] - mean_y) ** 2 for i in range(n))
+
+        if denom_x == 0 or denom_y == 0:
+            return 0.0
+
+        return numerator / (denom_x * denom_y) ** 0.5
+
+    def _form_groups(self) -> list:
+        """Group pairs by correlation threshold."""
+        groups = []
+        assigned = set()
+
+        # Sort pairs by number of high correlations (most connected first)
+        pair_scores = {}
+        for (s1, s2), corr in self.correlation_matrix.items():
+            if corr > self.threshold:
+                pair_scores[s1] = pair_scores.get(s1, 0) + 1
+                pair_scores[s2] = pair_scores.get(s2, 0) + 1
+
+        sorted_pairs = sorted(pair_scores.keys(), key=lambda p: pair_scores[p], reverse=True)
+
+        for pair in sorted_pairs:
+            if pair in assigned:
+                continue
+
+            # Find all pairs correlated with this one
+            group = [pair]
+            assigned.add(pair)
+
+            for other_pair in pair_scores:
+                if other_pair in assigned:
+                    continue
+
+                # Check if other_pair is correlated with all pairs in group
+                all_correlated = True
+                for g_pair in group:
+                    corr = self.correlation_matrix.get((g_pair, other_pair), 0)
+                    if corr <= self.threshold:
+                        all_correlated = False
+                        break
+
+                if all_correlated:
+                    group.append(other_pair)
+                    assigned.add(other_pair)
+
+            if len(group) > 1:
+                avg_corr = self._average_group_correlation(group)
+                groups.append({"pairs": group, "correlation": avg_corr})
+
+        return groups
+
+    def _average_group_correlation(self, group: list) -> float:
+        """Calculate average correlation within a group."""
+        correlations = []
+        for i, s1 in enumerate(group):
+            for s2 in group[i+1:]:
+                corr = self.correlation_matrix.get((s1, s2), 0)
+                correlations.append(abs(corr))
+        return sum(correlations) / len(correlations) if correlations else 0.0
+
+    def can_open_position(self, symbol: str, existing_positions: list) -> tuple[bool, str]:
+        """Check if opening a position would violate correlation rules."""
+        for group in self.groups:
+            if symbol in group["pairs"]:
+                for pos in existing_positions:
+                    pos_pair = pos.get("pair", "")
+                    if pos_pair in group["pairs"] and pos_pair != symbol:
+                        return False, f"Correlated with {pos_pair} (corr: {group['correlation']:.2f})"
+
+        return True, "OK"
+
+    def get_group(self, symbol: str) -> dict:
+        """Get the correlation group for a symbol."""
+        for group in self.groups:
+            if symbol in group["pairs"]:
+                return group
+        return None
+
+    def needs_update(self, hours: int = 4) -> bool:
+        """Check if correlation data needs updating."""
+        if self.last_update is None:
+            return True
+        elapsed = (datetime.now() - self.last_update).total_seconds() / 3600
+        return elapsed >= hours
+
+
+# =============================================================================
 # VALIDATION ENGINE
 # =============================================================================
 
 class TradeValidator:
     """Validates every trade decision against hard limits."""
 
-    def __init__(self, state: TradingState):
+    def __init__(self, state: TradingState, correlation_manager: CorrelationManager = None):
         self.state = state
+        self.correlation_manager = correlation_manager or CorrelationManager()
 
     def validate(self, decision: dict) -> tuple[bool, str]:
         """
@@ -297,11 +456,16 @@ class TradeValidator:
 
     def _check_correlation(self, decision: dict) -> tuple[bool, str]:
         pair = decision.get("pair", "")
-        for group in CORRELATION_GROUPS:
-            if pair in group:
-                for pos in self.state.state["open_positions"]:
-                    if pos.get("pair") in group:
-                        return False, f"Correlated position already open: {pos.get('pair')} (same group as {pair})"
+        existing_positions = self.state.state["open_positions"]
+
+        # Update correlation if needed
+        if self.correlation_manager.needs_update():
+            symbols = list(set([pair] + [p.get("pair", "") for p in existing_positions]))
+            self.correlation_manager.update(symbols)
+
+        can_open, reason = self.correlation_manager.can_open_position(pair, existing_positions)
+        if not can_open:
+            return False, f"Correlation violation: {reason}"
         return True, ""
 
     def _check_min_notional(self, decision: dict) -> tuple[bool, str]:
